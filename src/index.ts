@@ -38,6 +38,82 @@ const FONT_ROUTE = '/dsh-any-background/font'
 const FONT_UPLOAD_ROUTE = '/dsh-any-background/font/upload'
 /** Serves one rotation-pool image by name (the export path fetches these). */
 const ROTATION_FILE_ROUTE = '/dsh-any-background/rotation/file'
+/**
+ * Server-Sent Events channel: the ONLY way the node half speaks first.
+ *
+ * The RPC channel is request/response — a client can only learn that the
+ * server advanced the pool by asking it (i.e. on reload). Today two open pages
+ * each run their own 30 s `scheduleTick`, so whichever fires first switches the
+ * wallpaper and overwrites `current`/`lastRotate`; the other page keeps the old
+ * picture until it is reloaded. This channel carries one event, `rotation`,
+ * FROM the server AFTER the bytes in the wallpaper slot have already been
+ * replaced, so every page applies the same pick at the same time.
+ *
+ * No event is ever sent with a "please switch" instruction — a page that
+ * receives it re-reads the slot and lets the browser's cache-busted serve URL
+ * show the result (see `rotationEvent` in the client half).
+ */
+const EVENTS_ROUTE = '/dsh-any-background/events'
+/** SSE heartbeat cadence (comment-only, carries no state). */
+const EVENT_HEARTBEAT_MS = 25_000
+
+/** Who moved the wallpaper slot. "self" = the page that called `rotationSet`
+ *  and will paint from the response; "auto" = the cadence tick / `read`. */
+type RotationOrigin = 'self' | 'auto'
+
+/** Wallpaper switch after a successful server-side advance. `rev` is the
+ *  millisecond mtime of the wallpaper slot; the client appends it as a query
+ *  string for cache busting, which is why the vsn is not a body field. */
+interface RotationEvent { index: number; rev: number }
+
+/** Every live SSE subscriber. The owning `apply` scope clears it on unload —
+ *  the response objects behind these senders are owned by the web server, so a
+ *  plugin unload must forget them rather than try to close them. */
+const rotationSubscribers = new Set<(ev: RotationEvent) => void>()
+
+/** Drop every subscriber (plugin unload / webServer teardown). */
+function releaseSubscribers(): void {
+  rotationSubscribers.clear()
+}
+
+/** Server cadence tick. Mirrors the client's 30 s `scheduleTick`.
+ *
+ *  Overridable through `<DSH_HOME env>.…`-style plugin config for tests: the
+ *  smoke test drives the real tick, and waiting 30 s for it would make every
+ *  `npm test` run pay a minute for a single assertion. Read once at apply,
+ *  clamped to a sane floor so a typo cannot turn this into a busy loop. */
+function rotationTickMs(): number {
+  const raw = Number(process.env.DSH_ANY_BACKGROUND_TICK_MS ?? '')
+  return Number.isFinite(raw) && raw >= 100 ? Math.min(raw, 3_600_000) : 30_000
+}
+
+/** Push one event to every subscribed page; a throwing subscriber (a dropped
+ *  socket) is dropped, never allowed to abort the rotation itself. */
+function publishRotation(ev: RotationEvent): void {
+  for (const send of rotationSubscribers) {
+    try {
+      send(ev)
+    } catch {
+      rotationSubscribers.delete(send)
+    }
+  }
+}
+
+/** Stat the wallpaper slot and publish the new picture to every page. Runs
+ *  AFTER the bytes landed, so a subscriber that re-reads the serve URL always
+ *  gets the picture the event names. Best effort: a stat failure (slot raced
+ *  away) silently skips the broadcast — the next `read` still repairs every
+ *  page, exactly as before this channel existed. */
+async function broadcastRotation(index: number): Promise<void> {
+  if (rotationSubscribers.size === 0) return
+  let rev: number
+  try {
+    rev = (await stat(wallpaperPath())).mtimeMs
+  } catch {
+    return
+  }
+  publishRotation({ index, rev: Math.floor(rev) })
+}
 const UPLOAD_TMP = 'wallpaper.upload.tmp'
 const VIDEO_UPLOAD_TMP = 'video.upload.tmp'
 const FONT_UPLOAD_TMP = 'font.upload.tmp'
@@ -924,10 +1000,14 @@ async function handleRotationRemove(payload: unknown): Promise<{ ok: boolean; it
   return { ok: true, items: cfg.rotation.items }
 }
 
-/** Activate a rotation item: copy its bytes over the active wallpaper slot and
- *  return the serve URL so the client applies it live (bytes never round-trip
- *  through the RPC response). */
-async function handleRotationSet(payload: unknown): Promise<{ ok: boolean; wallpaperUrl?: string; error?: string }> {
+/** Activate a rotation item on behalf of `origin`.
+ *
+ *  `origin` is the CLIENT ITSELF that already applied the switch from the RPC
+ *  response ("self"), or nobody — the server's own cadence tick ("auto"). Only
+ *  "auto" broadcasts: a page that moved the slot and pushed the event to
+ *  everyone else would be telling them to apply a switch it is about to make
+ *  visible twice. */
+async function handleRotationSet(payload: unknown, origin: RotationOrigin = 'self'): Promise<{ ok: boolean; wallpaperUrl?: string; error?: string }> {
   const idx = (payload as { index?: unknown } | null)?.index
   if (typeof idx !== 'number' || !isFinite(idx)) return { ok: false, error: 'invalid index' }
   const cfg = await readConfig()
@@ -945,23 +1025,28 @@ async function handleRotationSet(payload: unknown): Promise<{ ok: boolean; wallp
   }
   // Persist the cursor the way advanceRotationIfDue does — merged into the
   // FRESHEST on-disk config so a slider save landing inside this window is not
-  // clobbered. Manual activation mirrors the client's own semantics: only
-  // current moves; lastRotate fills in when it was never set, so a manual pick
-  // does not reset the daily/weekly cadence clock. A failed persist only
-  // re-opens the reload race the client's debounced save already closes — the
-  // wallpaper slot is switched either way, so this must not fail the response.
+  // clobbered. Manual activation MOVES `lastRotate` too: since the manual
+  // switch and the cadence timer both drive the same slot, a manual pick is one
+  // advance on that clock — otherwise picking a picture at 12:59 makes the
+  // hourly tick replace it at 13:00, which reads as the click being ignored.
+  // A failed persist only re-opens the reload race the client's debounced save
+  // already closes — the wallpaper slot is switched either way, so this must
+  // not fail the response.
   try {
     const fresh = await readConfig()
     if (fresh.rotation.items[i] !== undefined) {
       const merged: ThemeConfig = {
         ...fresh,
-        rotation: { ...fresh.rotation, current: i, lastRotate: fresh.rotation.lastRotate ?? new Date().toISOString() },
+        rotation: { ...fresh.rotation, current: i, lastRotate: new Date().toISOString() },
       }
       if (!(await writeConfig(merged))) {
         console.warn('dsh-any-background: rotation cursor did not persist (the client save will catch up)')
       }
     }
   } catch { /* best effort — see above */ }
+  // Everyone but the page that asked: the requester already painted from the
+  // response, the rest must repaint from the slot we just overwrote.
+  if (origin === 'auto') void broadcastRotation(i)
   return { ok: true, wallpaperUrl: WALLPAPER_ROUTE }
 }
 
@@ -1301,6 +1386,63 @@ async function handleVideoUpload(req: any, res: any): Promise<void> {
   }
 }
 
+/** Server-Sent Events endpoint: one long-lived GET per page.
+ *
+ *  Not an RPC endpoint on purpose — the RPC channel is request/response, and
+ *  what a page needs here is the opposite direction (the timer advanced the
+ *  pool while nobody was asking). The route is fenced with the same
+ *  Host/Origin + browser-auth check as the RPC channel: an unauthenticated
+ *  page gets a 401/403, never a live event stream (the GET <img>/<video> serve
+ *  routes stay open because the browser loads them without custom headers).
+ *
+ *  Delivery contract, and what the client may assume:
+ *   · every `rotation` event means the bytes in the wallpaper slot have ALREADY
+ *     been replaced; the receiver only needs to repaint from the serve URL;
+ *   · a heartbeat comment every 25 s keeps intermediaries from closing the
+ *     stream and proves liveness without carrying state;
+ *   · a subscriber that goes away is removed on the response `close` event, so
+ *     a closed tab cannot pin memory or receive a broadcast. */
+function serveEvents(req: any, res: any): void {
+  if (req.method !== 'GET') {
+    res.writeHead(405, { 'Content-Type': 'application/json' })
+    res.end(JSON.stringify({ ok: false, error: 'events route only serves GET' }))
+    return
+  }
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream; charset=utf-8',
+    'Cache-Control': 'no-store, no-transform',
+    Connection: 'keep-alive',
+    // nginx and friends buffer by default; the heartbeat would never arrive.
+    'X-Accel-Buffering': 'no',
+  })
+  res.write(': connected\n\n')
+  const send = (ev: RotationEvent): void => {
+    res.write(`event: rotation\ndata: ${JSON.stringify(ev)}\n\n`)
+  }
+  // Snapshot the retry hint BEFORE registration: `retry:` is the client's
+  // reconnect delay and the browser reconnects on its own after a drop.
+  res.write('retry: 3000\n\n')
+  rotationSubscribers.add(send)
+  const drop = (): void => {
+    rotationSubscribers.delete(send)
+    clearInterval(heartbeat)
+  }
+  const heartbeat = setInterval(() => {
+    try {
+      res.write(': ping\n\n')
+    } catch {
+      drop()
+    }
+  }, EVENT_HEARTBEAT_MS)
+  // An unref'd timer must not keep the process alive — but this one is owned by
+  // a live socket, so the socket itself does. Guard for hosts that hand us a
+  // non-Node timer object.
+  heartbeat.unref?.()
+  req.on('close', drop)
+  res.on('close', drop)
+  res.on('error', drop)
+}
+
 /** Stream the stored wallpaper: sniffed MIME, no caching (uploads and rotation
  *  replace the file in place). */
 async function serveWallpaper(req: any, res: any): Promise<void> {
@@ -1592,20 +1734,27 @@ const RPC_BODY_MAX = 300 * 1024 * 1024
  *  fallback and skips when this already advanced (the `rotated` flag).
  *  The due/next math is the SHARED implementation (`src/shared/rotation.ts`)
  *  so both halves can never disagree on a day/week boundary. */
-async function advanceRotationIfDue(): Promise<boolean> {
+/** Advance the rotation pool when its cadence is due. Returns the activated
+ *  pool index, or null when nothing was due / the switch failed.
+ *
+ *  `<origin>` decides the side effect: 'read' means the caller (an RPC `read`)
+ *  is about to repaint everything itself; 'auto' means NO page is asking —
+ *  the server's own cadence timer moved the slot and every open page must be
+ *  told (`broadcastRotation`) instead of discovering it on the next reload. */
+async function advanceRotationIfDue(origin: 'read' | 'auto' = 'read'): Promise<number | null> {
   const cfg = await readConfig()
   const rot = cfg.rotation
-  if (!rotationDue(rot)) return false
+  if (!rotationDue(rot)) return null
   const now = new Date()
   const idx = pickNextRotationIndex(rot)
   const item = rot.items[idx]
-  if (item === undefined) return false
+  if (item === undefined) return null
   try {
     // copyFile streams kernel-side (see handleRotationSet).
     await copyFile(dshHomePath(DATA_DIR, ROTATION_DIR, item.file), wallpaperPath())
   } catch (e) {
     console.error('dsh-any-background: failed to advance the rotation pool', e)
-    return false
+    return null
   }
   // Persist only the rotation fields, merged into the FRESHEST on-disk config:
   // the browser half saves slider moves on a 250 ms debounce, and writing the
@@ -1621,8 +1770,12 @@ async function advanceRotationIfDue(): Promise<boolean> {
   }
   // A failed write means lastRotate/current never land on disk — report "not
   // advanced" so the client-side fallback performs (and persists) the switch.
-  if (!(await writeConfig(merged))) return false
-  return true
+  if (!(await writeConfig(merged))) return null
+  // Told to everyone only when nobody is asking (the timer). A `read` caller
+  // already repaints from its own response; broadcasting there would make that
+  // page apply the same switch twice.
+  if (origin === 'auto') await broadcastRotation(idx)
+  return idx
 }
 
 /** Dispatch one decoded RPC method to the matching persistence routine and
@@ -1638,7 +1791,8 @@ async function handleRpcMethod(
       case 'read': {
         // Advance a due rotation BEFORE reading the wallpaper slot, so the
         // restore on (re)load paints the new picture from the first apply.
-        const rotated = await advanceRotationIfDue()
+        const advanced = await advanceRotationIfDue('read')
+        const rotated = advanced !== null
         // Image, video and font all travel as serve URLs, never as bytes.
         const config = await readConfig()
         // First run: no theme-config.json has ever been written. The CLIENT
@@ -1829,6 +1983,41 @@ export function apply(ctx: any): void {
       }),
       'dsh-any-background: rpc channel',
     )
+    // The server's own cadence tick: the ONLY clock that survives a closed page
+    // and the only one that is allowed to drive the slot while nobody asks (a
+    // closed tab cannot run a timer, and N open tabs each running their own
+    // 30 s tick was the race this exists to remove). It ticks the rotation
+    // cadence only — the day/night profile schedule stays client-side because
+    // applying a profile is a pure client appearance operation.
+    //
+    // 30 s mirrors the client tick: the cadence is bucketed to whole hours at
+    // the coarsest, so the tick only bounds how late a switch may land, and a
+    // finer tick would stat the config for nothing. `unref` keeps a sleeping
+    // host from being pinned awake by it.
+    const rotationTimer = setInterval(() => {
+      // Errors inside must never escape into the interval callback: an
+      // unhandled rejection here would be logged once per 30 s forever.
+      void advanceRotationIfDue('auto').catch(e => {
+        console.error('dsh-any-background: the rotation tick failed', e)
+      })
+    }, rotationTickMs())
+    rotationTimer.unref?.()
+    webCtx.effect(() => () => clearInterval(rotationTimer), 'dsh-any-background: rotation tick')
+    const eventsFence = (req: any, res: any): void => {
+      const rejection = webCtx.connection.requestRejection(req)
+      if (rejection !== undefined) {
+        res.writeHead(rejection)
+        res.end(rejection === 401 ? 'unauthorized' : 'forbidden')
+        return
+      }
+      serveEvents(req, res)
+    }
+    webCtx.effect(
+      () => webCtx.webServer.register({ kind: 'exact', path: EVENTS_ROUTE, handler: eventsFence }),
+      'dsh-any-background: events route',
+    )
+    // A disposed plugin must not keep broadcasting into dead sockets.
+    webCtx.effect(() => () => releaseSubscribers(), 'dsh-any-background: event subscribers')
     // Longest prefix wins over the RPC channel's shorter one; exact beats
     // prefix, so uploads land in the upload handler even though UPLOAD_ROUTE
     // sits inside VIDEO_ROUTE. Effects auto-dispose with the injected scope.

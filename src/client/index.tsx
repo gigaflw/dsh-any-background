@@ -6,11 +6,12 @@
  * lifting lives in the sibling modules (state/rpc/wallpaper/utils/components).
  */
 import { defineStore } from './runtime'
-import type { Ctx, RpcResultLike, BoundActions, ThemeSectionProps, PartOpacities, PartBlurs, PartStrokes, BackgroundType, GeneratedBgParams, ProfileAppearance, ProfileEntry, RotationItem, ScheduleConfig, SchemeOverride, UploadOutcome, StoreInstance } from './types'
+import type { Ctx, RpcResultLike, BoundActions, ThemeSectionProps, PartOpacities, PartBlurs, PartStrokes, BackgroundType, GeneratedBgParams, ProfileAppearance, ProfileEntry, RotationItem, RotationConfig, ScheduleConfig, SchemeOverride, UploadOutcome, StoreInstance } from './types'
 import { NS, zh, en } from './i18n'
 import { cfg, rHasColor, rColor, rWp, rWpImage, rWpVideo, rBgState, rVideoBgState, setWpUrl, setWpImageUrl, setWpVideoUrl, setWpVideoSnapshot, setBgState, adoptConfig, DEFAULT_CONFIG, setBgDark, rBgDark, rProfiles, rRotation, rSchedule, rScheme, rColorScheme, rSchemeOverride, currentAppearance, applyAppearance } from './state'
-import { RPC_CHANNEL, VIDEO_SERVE_URL, FONT_SERVE_URL, fontServeUrl, initRpc, saveConfig, flushSave, loadPersisted, persistWallpaper, persistVideo, persistConfig, uploadVideo, uploadFont, removeFont as rpcRemoveFont, rotationAdd, rotationRemove, rotationActivate, rotationRestore, rotationFileUrl, setVideoFromUrl as rpcSetVideoFromUrl } from './rpc'
+import { RPC_CHANNEL, EVENTS_ROUTE, WALLPAPER_SERVE_URL, VIDEO_SERVE_URL, FONT_SERVE_URL, fontServeUrl, initRpc, saveConfig, flushSave, loadPersisted, persistWallpaper, persistVideo, persistConfig, uploadVideo, uploadFont, removeFont as rpcRemoveFont, rotationAdd, rotationRemove, rotationActivate, rotationRestore, rotationFileUrl, setVideoFromUrl as rpcSetVideoFromUrl } from './rpc'
 import type { RotationPoolEntry } from './rpc'
+import { startRotationEvents } from './rotation-events'
 import { applyWp, teardownWp, applySettingsOverrides, applyPanelOverrides, applyStrokes, applyFontFace, watchParts, watchThemeResets, regenerateGeneratedBg, setBackgroundType, updateGeneratedBg, applyThemeColor, onGeneratedSnapshot, watchWallpaperDragQuality, clearThemeTokens, onVerdictApplied, onColorAdopted, LABEL_TOKENS, SETTINGS_PANEL_SEL } from './wallpaper'
 import { mountStaticStyles } from './host-compat/styles'
 import { genTokens, hslToHsv, hsvToHsl, extractWallpaperColor } from './utils/color'
@@ -288,10 +289,43 @@ export function apply(ctx: Ctx): void {
     bound?.syncColor(hslToHsv(hsl[0], hsl[1], hsl[2]), colorRev)
   }
 
-  /** Activate a rotation item: the server copies its bytes into the wallpaper
-   *  slot; the client applies the returned serve URL through the normal image
-   *  path, then re-extracts the theme color from the new picture so the
-   *  palette follows the rotation. */
+  /** Point the page at whatever is now in the wallpaper slot, re-extract the
+   *  palette from it, and persist the bookkeeping.
+   *
+   *  Shared by both switch paths — a local activate (`applyRotationIndex`) and a
+   *  server-announced one (`onRotationEvent`) — because they differ ONLY in who
+   *  moved the bytes: the rest of the page (background type, image URL, theme
+   *  color, placement state) has to end up identical, and a second copy of this
+   *  sequence is how the two halves drifted apart before.
+   *
+   *  `rev` is the slot mtime from an event; the local path passes nothing and
+   *  lets `bumpImageRev` mint its own cache-buster. Either way the serve URL
+   *  changes, so every URL-keyed cache in the wallpaper layer discards the old
+   *  pixels. */
+  const applyRotatedSlot = async (rot: RotationConfig, rev?: number): Promise<void> => {
+    // Mirror setWpFromServer's state switch (bound is not initialized yet here).
+    cfg.backgroundType = 'image'
+    setBgDark(null)
+    setWpImageUrl(rev === undefined ? WALLPAPER_SERVE_URL : `${WALLPAPER_SERVE_URL}?rev=${rev}`)
+    setWpUrl(rWpImage())
+    setBgState({ ...DEFAULT_CONFIG.bgState })
+    cfg.rotation = { ...rot, lastRotate: new Date().toISOString() }
+    // The picture just switched, so any saved pick describes the old wallpaper:
+    // extract once from the new one to re-adapt (placement state matches the
+    // previous image, so a size mismatch makes the extractor fall back to the
+    // whole picture — the desired behavior for a fresh wallpaper).
+    await adoptWallpaperColor(rWp()!)
+    applyThemeColor()
+    syncBg()
+    saveConfig()
+    syncMetaNow()
+  }
+
+  /** Activate a rotation item on THIS page's request: the server copies its
+   *  bytes into the wallpaper slot and answers with the serve URL, which this
+   *  page then applies. Other open pages hear about the same switch over the
+   *  event stream (the server broadcasts on the cadence path; a local pick is
+   *  not broadcast — this page is the one applying it). */
   const applyRotationIndex = async (idx: number, auto: boolean): Promise<boolean> => {
     const rot = rRotation()
     if (idx < 0 || idx >= rot.items.length) return false
@@ -300,35 +334,40 @@ export function apply(ctx: Ctx): void {
       console.warn('dsh-any-background: rotation activate failed', r.error)
       return false
     }
-    // The server already persisted the bytes into the wallpaper slot; mirror
-    // setWpFromServer's state switch (bound is not initialized yet here).
-    cfg.backgroundType = 'image'
-    setBgDark(null)
-    setWpImageUrl(r.wallpaperUrl)
-    setWpUrl(rWpImage())
-    setBgState({ ...DEFAULT_CONFIG.bgState })
-    cfg.rotation = { ...rot, current: idx, lastRotate: auto || rot.lastRotate === null ? new Date().toISOString() : rot.lastRotate }
-    // The picture just switched, so any saved pick describes the old wallpaper:
-    // extract once from the new one to re-adapt (placement state matches the
-    // previous image, so a size mismatch makes the extractor fall back to the
-    // whole picture — the desired behavior for a fresh wallpaper).
-    if (cfg.backgroundType === 'image') await adoptWallpaperColor(rWp()!)
-    applyThemeColor()
-    syncBg()
-    saveConfig()
-    syncMetaNow()
+    // `auto` is the pre-event-stream fallback provenance; with the server
+    // owning the cadence the only client-initiated advance left is the manual
+    // button, and both paths stamp lastRotate inside applyRotatedSlot.
+    void auto
+    await applyRotatedSlot({ ...rot, current: idx })
     return true
   }
 
-  // The cadence math is the shared implementation (`src/shared/rotation.ts`)
-  // — the same one the server advances with inside `read`, so the fallback
-  // here can never disagree with the server on a day/week boundary.
-  const rotationDue = (): boolean => sharedRotationDue(rRotation())
+  /** True while the server's event stream is connected (see maybeRotate). */
+  let rotationEventsLive = false
+
+  /** A switch the SERVER made on its own cadence tick. The bytes are already in
+   *  the slot — everything this page owns is repainting, plus adopting the new
+   *  `current` so the pool selector highlights the picture that is really up. */
+  const onRotationEvent = async (ev: { index: number; rev: number }): Promise<void> => {
+    const rot = rRotation()
+    if (ev.index < 0 || ev.index >= rot.items.length) return
+    if (ev.index === rot.current && !sharedRotationDue(rot)) return
+    await applyRotatedSlot({ ...rot, current: ev.index }, ev.rev)
+  }
 
   const pickNextRotationIndex = (): number => sharedPickNext(rRotation())
 
+  /** Fallback advance for a page that is NOT on the event stream.
+   *
+   *  While `startRotationEvents` is connected the server owns the cadence and
+   *  announces every switch, so this must stay silent — a second advance from
+   *  the page would move the slot a moment after the server moved it and the
+   *  two pages would disagree again. It only runs when the stream is down or
+   *  this browser has no `EventSource`, which is exactly the behaviour the
+   *  plugin had before the stream existed. */
   const maybeRotate = async (): Promise<void> => {
-    if (!rotationDue()) return
+    if (rotationEventsLive) return
+    if (!sharedRotationDue(rRotation())) return
     await applyRotationIndex(pickNextRotationIndex(), true)
   }
 
@@ -453,6 +492,28 @@ export function apply(ctx: Ctx): void {
     window.clearInterval(scheduleTimer)
     schemeMq?.removeEventListener?.('change', scheduleTick)
   }, 'dsh-any-background: schedule timer')
+  // The server's wallpaper-switch channel. Connected here, at the end of apply,
+  // so a switch that landed while the page was booting cannot race the restore
+  // above (the `read` it just did already returned the new picture).
+  //
+  // While it is connected the server owns the cadence: `rotationEventsLive`
+  // keeps the 30 s tick above from advancing the pool a second time, and
+  // `maybeRotate` degrades to a no-op. A browser without `EventSource` (or a
+  // host that failed to register the route) leaves both flags false and the
+  // page keeps the pre-stream behaviour — the feature degrades, it never
+  // breaks the boot.
+  rotationEventsLive = true
+  const stopRotationEvents = startRotationEvents({
+    url: EVENTS_ROUTE,
+    onOpen: () => { rotationEventsLive = true },
+    onEvent: ev => { void onRotationEvent(ev).catch(e => {
+      console.warn('dsh-any-background: applying a server-side rotation failed', e)
+    }) },
+  })
+  ctx.effect(() => () => {
+    rotationEventsLive = false
+    stopRotationEvents()
+  }, 'dsh-any-background: rotation events')
   ctx.effect(() => () => { teardownWp() }, 'dsh-any-background: wp cleanup')
   ctx.effect(() => startBetterSidebarWatch(), 'dsh-any-background: better-sidebar watch')
   ctx.effect(() => startThirdPartyWatch(), 'dsh-any-background: third-party scan')

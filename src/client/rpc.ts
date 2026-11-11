@@ -3,6 +3,8 @@ import { cfg, adoptConfig, setWpUrl, setWpImageUrl, setWpVideoUrl, rWpImage } fr
 import { adoptHostInfo } from './host-compat/release'
 
 export const RPC_CHANNEL = '/dsh-any-background'
+/** Same-origin SSE route the node half uses to announce a cadence switch. */
+export const EVENTS_ROUTE = '/dsh-any-background/events'
 /** Same-origin serve URL of the persisted video (enough for <video src>/fetch). */
 export const VIDEO_SERVE_URL = '/dsh-any-background/video'
 /** Same-origin serve URL of the persisted wallpaper (native <img> loading). */

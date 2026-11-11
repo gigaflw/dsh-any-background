@@ -28,15 +28,33 @@ export function isoWeekKey(d: Date): string {
   return `${t.getUTCFullYear()}-W${week}`
 }
 
+/**
+ * Upper bound on an `hourly` gap, and the reason this file no longer decides
+ * "due" by bucket equality alone.
+ *
+ * Buckets (`hourKey` / `toDateString` / `isoWeekKey`) are computed from the
+ * local wall clock, but the value they are compared against — `lastRotate` —
+ * is stamped by whichever half last advanced: the Node host or the browser.
+ * Two clocks in two processes can disagree by minutes, and a skew that pushes
+ * the host's stamp past the local hour boundary made `last === now` in bucket
+ * terms, so the cadence simply stopped advancing for that hour. The elapsed
+ * rule below closes that: a bucket difference OR a real elapsed gap is due.
+ * (The gap is measured on the browser's own clock against a server stamp, so
+ * it tolerates skew in the safe direction — a slightly late advance, never a
+ * missed one.)
+ */
+const HOURLY_RECOVER_MS = 55 * 60 * 1000
+
 /** Whether the pool should advance right now. */
 export function rotationDue(rot: RotationCadence, now: Date = new Date()): boolean {
   if (!rot.enabled || rot.items.length === 0) return false
   if (rot.interval === 'reload') return true
   const last = rot.lastRotate !== null ? new Date(rot.lastRotate) : null
   if (last === null || isNaN(last.getTime())) return true
-  if (rot.interval === 'hourly') return hourKey(last) !== hourKey(now)
-  if (rot.interval === 'daily') return last.toDateString() !== now.toDateString()
-  return isoWeekKey(last) !== isoWeekKey(now)
+  const elapsed = now.getTime() - last.getTime()
+  if (rot.interval === 'hourly') return hourKey(last) !== hourKey(now) || elapsed >= HOURLY_RECOVER_MS
+  if (rot.interval === 'daily') return last.toDateString() !== now.toDateString() || elapsed >= 24 * 3_600_000
+  return isoWeekKey(last) !== isoWeekKey(now) || elapsed >= 7 * 24 * 3_600_000
 }
 
 /** Epoch-hour bucket: hourly cadence advances on each full hour boundary

@@ -20,6 +20,9 @@ import { join } from 'node:path'
 
 const home = mkdtempSync(join(tmpdir(), 'dab-smoke-'))
 process.env.DSH_HOME = home
+// The server cadence tick is driven for real in step 5e; the plugin reads this
+// once at apply, so it must be set before the import below.
+process.env.DSH_ANY_BACKGROUND_TICK_MS = '200'
 const RPC_PATH = '/dsh-any-background'
 // The browser half calls `ctx.connection.rpc.call('/dsh-any-background',
 // 'dshAnyBackground/<method>', payload)`, which the host transport turns into
@@ -70,6 +73,55 @@ async function rpc(method, payload) {
   assert.equal(body.type, 'server-response', `${method}: envelope type`)
   assert.equal(body.result.ok, true, `${method}: ${JSON.stringify(body.result.error)}`)
   return body.result.value
+}
+
+/** Read the plugin's SSE route far enough to see one `rotation` event.
+ *  Node's fetch can stream an open-ended response body, so the test needs no
+ *  dependency and no EventSource shim. */
+function readEventStream(url, signal) {
+  let markConnected
+  const connected = new Promise(resolve => { markConnected = resolve })
+  const next = (async () => {
+    const res = await fetch(url, { signal })
+    assert.equal(res.headers.get('content-type')?.split(';')[0], 'text/event-stream', 'events: SSE content type')
+    const reader = res.body.getReader()
+    const dec = new TextDecoder()
+    let buf = ''
+    let sawConnected = false
+    for (;;) {
+      const { value, done } = await reader.read()
+      if (done) throw new Error('events: the stream ended before any rotation event')
+      buf += dec.decode(value, { stream: true })
+      if (!sawConnected && buf.includes(': connected')) { sawConnected = true; markConnected() }
+      // Frames are separated by a blank line; a comment-only frame is skipped
+      // and a `rotation` frame is parsed.
+      for (;;) {
+        const cut = buf.indexOf('\n\n')
+        if (cut < 0) break
+        const frame = buf.slice(0, cut)
+        buf = buf.slice(cut + 2)
+        const dataLine = frame.split('\n').find(l => l.startsWith('data: '))
+        if (frame.startsWith('event: rotation') && dataLine !== undefined) {
+          return JSON.parse(dataLine.slice('data: '.length))
+        }
+      }
+    }
+  })()
+  // A failed read must not become an unhandled rejection while the test awaits
+  // the assertion instead.
+  next.catch(() => {})
+  /** Bounded wait: an absent broadcast must FAIL the test, not hang it —
+   *  the first version of this assertion hung for two minutes when the
+   *  broadcast was deliberately removed, which reads as "slow" instead of
+   *  "broken". */
+  const nextWithTimeout = (ms) => Promise.race([
+    next,
+    new Promise((_, reject) => {
+      const t = setTimeout(() => reject(new Error(`events: no rotation event within ${ms} ms`)), ms)
+      t.unref?.()
+    }),
+  ])
+  return { connected, next, nextWithTimeout }
 }
 
 const configFile = join(home, '.dsh-any-background-data', 'theme-config.json')
@@ -204,6 +256,41 @@ try {
   })
   const badBody = await badRestore.json()
   assert.equal(badBody.result.value.ok, false, 'rotationRestore: path traversal refused')
+
+  // 5e. The server's wallpaper-switch channel (SSE). Three things have to be
+  //     true, and none of them is observable from the RPC channel:
+  //       · the route answers `text/event-stream` and stays open (a 200 that
+  //         closes immediately would leave every page silently unheard);
+  //       · the server's OWN cadence tick advances the pool with no page
+  //         asking — the whole point of the Node half owning the clock;
+  //       · that advance is broadcast to the open stream with the index and the
+  //         slot mtime, in that order (bytes first, event second), so the
+  //         receiver can repaint without guessing.
+  const eventsRoute = routes.get('/dsh-any-background/events')
+  assert.ok(eventsRoute !== undefined, 'events route registered')
+  const eventsServer = createServer((req, res) => { void eventsRoute.handler(req, res) })
+  await new Promise(resolve => eventsServer.listen(0, '127.0.0.1', resolve))
+  const eventsPort = eventsServer.address().port
+  const ac = new AbortController()
+  try {
+    const reading = readEventStream(`http://127.0.0.1:${eventsPort}/dsh-any-background/events`, ac.signal)
+    // The stream's own CONNECTING comment proves the headers landed before we
+    // arm the cadence; anything else and the "no event" case is ambiguous.
+    await reading.connected
+    // A pool of two, cadence due in an hour that already passed: the tick below
+    // is the only mover. `lastRotate` two hours back keeps the order mode
+    // deterministic (0 -> 1).
+    const pool = (await rpc('rotationAdd', { dataUrl: PNG_1PX, thumb: PNG_1PX })).items
+    await rpc('writeConfig', { config: { rotation: { enabled: true, mode: 'order', interval: 'hourly', current: 0, items: pool, lastRotate: new Date(Date.now() - 2 * 3600e3).toISOString() } } })
+    const before = onDisk().rotation.current
+    const ev = await reading.nextWithTimeout(5000)
+    assert.equal(ev.index, (before + 1) % pool.length, 'events: the tick advanced the cursor and announced the new index')
+    assert.ok(typeof ev.rev === 'number' && ev.rev > 0, 'events: the event carries a slot revision')
+    assert.equal(onDisk().rotation.current, ev.index, 'events: the announced index is the persisted one')
+  } finally {
+    ac.abort()
+    await new Promise(resolve => eventsServer.close(resolve))
+  }
 
   // 6. The wallpaper upload route refuses a body whose bytes are not an image
   //    even when the Content-Type claims one (the same fence as the URL
